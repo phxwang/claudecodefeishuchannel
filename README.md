@@ -67,7 +67,7 @@ claude plugin add ./feishuclaudecode
 The Feishu channel is a development channel plugin. Launch Claude Code with:
 
 ```bash
-claude --dangerously-load-development-channels server:feishu
+claude --dangerously-load-development-channels plugin:feishu@feishu-local
 ```
 
 > **Note:** The `--dangerously-load-development-channels` flag is required because this is a local development channel. The flag tells Claude Code to load the channel server.
