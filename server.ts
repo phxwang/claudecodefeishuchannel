@@ -249,7 +249,7 @@ const mcp = new Server(
 )
 
 const pendingPerms = new Map<string, { tool_name: string; description: string; input_preview: string }>()
-const pendingConfirms = new Map<string, { chatId: string; senderId: string }>()
+const pendingConfirms = new Map<string, { chatId: string; senderId: string; title: string; content: string }>()
 
 function buildPermCard(tool_name: string, description: string, request_id: string): string {
   return JSON.stringify({
@@ -479,7 +479,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const title = (a.title as string | undefined) ?? '⚡ 操作确认'
         assertAllowedChat(chatId, loadAccess())
         const code = genConfirmCode()
-        pendingConfirms.set(code, { chatId, senderId: '' })
+        pendingConfirms.set(code, { chatId, senderId: '', title, content })
         const card = buildConfirmCard(title, content, code)
         const r = await apiClient.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'interactive', content: card } })
         const msgId = (r as any)?.message_id ?? (r as any)?.data?.message_id ?? ''
@@ -503,7 +503,30 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
   if (action === 'perm_allow' || action === 'perm_deny') {
     const behavior = action === 'perm_allow' ? 'allow' : 'deny'
     void mcp.notification({ method: 'notifications/claude/channel/permission', params: { request_id: code, behavior } })
-    return { toast: { type: behavior === 'allow' ? 'success' : 'info', content: behavior === 'allow' ? '已允许' : '已拒绝' } }
+    const perm = pendingPerms.get(code)
+    pendingPerms.delete(code)
+    const statusText = behavior === 'allow' ? '✅ 已允许' : '❌ 已拒绝'
+    return {
+      toast: { type: behavior === 'allow' ? 'success' : 'info', content: statusText },
+      card: {
+        type: 'raw',
+        data: {
+          schema: '2.0',
+          config: { wide_screen_mode: true },
+          header: {
+            title: { tag: 'plain_text', content: `🔐 Permission Request — ${statusText}` },
+            template: behavior === 'allow' ? 'green' : 'grey',
+          },
+          body: {
+            elements: [
+              ...(perm ? [{ tag: 'markdown', content: `**工具：** \`${perm.tool_name}\`\n\n${perm.description}` }] : []),
+              { tag: 'hr' },
+              { tag: 'markdown', content: `**${statusText}**` },
+            ],
+          },
+        },
+      },
+    }
   }
 
   // Handle confirm card buttons
@@ -525,7 +548,28 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
       },
     },
   })
-  return { toast: { type: isConfirm ? 'success' : 'info', content: isConfirm ? '已确认操作' : '已取消操作' } }
+  const statusText = isConfirm ? '✅ 已确认' : '❌ 已取消'
+  return {
+    toast: { type: isConfirm ? 'success' : 'info', content: statusText },
+    card: {
+      type: 'raw',
+      data: {
+        schema: '2.0',
+        config: { wide_screen_mode: true },
+        header: {
+          title: { tag: 'plain_text', content: `${pending.title || '⚡ 操作确认'} — ${statusText}` },
+          template: isConfirm ? 'green' : 'grey',
+        },
+        body: {
+          elements: [
+            ...(pending.content ? [{ tag: 'markdown', content: pending.content }] : []),
+            { tag: 'hr' },
+            { tag: 'markdown', content: `**${statusText}**` },
+          ],
+        },
+      },
+    },
+  }
 }
 
 async function handleInbound(data: any) {
