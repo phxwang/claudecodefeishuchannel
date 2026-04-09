@@ -104,7 +104,16 @@ You're ready — send messages to the bot and Claude will respond.
 
 ## Multi-Group Router
 
-For multiple Feishu groups that each need an isolated Claude Code instance, use the **router**. It maintains a single Feishu WebSocket connection and spawns a dedicated Claude process per group.
+For multiple Feishu groups that each need an isolated Claude Code instance, use the **router**. It maintains a single Feishu WebSocket connection and routes messages to Claude instances via a Unix socket.
+
+### Architecture
+
+```
+                             ┌─ server.ts (cwd=project-a) ─ Claude Code
+Feishu WebSocket → router ───┤─ server.ts (cwd=project-b) ─ Claude Code
+               (Unix socket) └─ server.ts (cwd=project-c) ─ Claude Code
+                                  ▲ workers auto-connect on startup
+```
 
 ### 1. Configure Group Workdirs
 
@@ -124,7 +133,7 @@ Add `workdir` to each group in `~/.claude/channels/feishu/access.json`:
       "workdir": "/path/to/project-b"
     }
   },
-  "defaultWorkdir": "/path/to/default-project"  // for DMs
+  "defaultWorkdir": "/path/to/default-project"  // DMs route here
 }
 ```
 
@@ -135,23 +144,26 @@ cd /path/to/feishuchannel
 bun run router
 ```
 
-The router will:
-- Connect to Feishu WebSocket (single connection)
-- Spawn a Claude instance per group on first message
-- Route messages to the correct instance by `chat_id`
-- Recycle idle instances after 30 minutes (configurable via `idleTimeout` per group)
+### 3. Start Claude Code Instances
 
-### 3. Check Status
+In separate terminals, start Claude in each project directory:
 
-Send `SIGUSR1` to the router process to dump instance status:
+```bash
+cd /path/to/project-a
+claude --dangerously-load-development-channels plugin:feishu@feishu-local
+
+cd /path/to/project-b
+claude --dangerously-load-development-channels plugin:feishu@feishu-local
+```
+
+Each Claude's feishu plugin auto-detects the router socket and connects, registering its `cwd`. The router matches incoming messages by `chat_id → workdir → connected worker`.
+
+### 4. Check Status
 
 ```bash
 kill -USR1 $(pgrep -f 'bun router.ts')
+cat ~/.claude/channels/feishu/router-debug.log | tail -10
 ```
-
-Check `~/.claude/channels/feishu/router-debug.log` for router logs.
-
-> **Note:** When using the router, do NOT start Claude with `--dangerously-load-development-channels` separately — the router handles spawning.
 
 ## Access Management
 

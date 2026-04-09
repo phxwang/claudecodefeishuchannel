@@ -11,9 +11,10 @@ import { z } from 'zod'
 import * as lark from '@larksuiteoapi/node-sdk'
 import { randomBytes } from 'crypto'
 import { execSync } from 'child_process'
+import { connect as netConnect } from 'net'
 import {
   readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync,
-  statSync, renameSync, realpathSync, chmodSync, createReadStream, watch,
+  statSync, renameSync, realpathSync, chmodSync, createReadStream, existsSync,
 } from 'fs'
 import { homedir } from 'os'
 import { join, sep, extname, basename } from 'path'
@@ -42,10 +43,10 @@ function ancestorHasChannelArg(): boolean {
   return false
 }
 const CHANNEL_MODE = ancestorHasChannelArg()
-const WORKER_CHAT_ID = process.env.FEISHU_CHAT_ID ?? ''
-const WORKER_MODE = !!WORKER_CHAT_ID
 
 const STATE_DIR = process.env.FEISHU_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'feishu')
+const ROUTER_SOCK = join(STATE_DIR, 'router.sock')
+const WORKER_MODE = CHANNEL_MODE && existsSync(ROUTER_SOCK)
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -230,7 +231,7 @@ function checkApprovals() {
     })()
   }
 }
-if (!STATIC && (CHANNEL_MODE || WORKER_MODE)) setInterval(checkApprovals, 5000).unref()
+if (!STATIC && CHANNEL_MODE) setInterval(checkApprovals, 5000).unref()
 
 function chunkText(text: string, limit: number): string[] {
   if (text.length <= limit) return [text]
@@ -683,36 +684,37 @@ dbg(`server starting (CHANNEL_MODE=${CHANNEL_MODE}, WORKER_MODE=${WORKER_MODE}, 
 let wsClient: lark.WSClient | null = null
 
 if (WORKER_MODE) {
-  // Worker mode: read messages from router inbox, not from WebSocket
-  const routerInbox = join(STATE_DIR, 'router', WORKER_CHAT_ID)
-  mkdirSync(routerInbox, { recursive: true })
-  dbg(`worker mode: watching ${routerInbox}`)
-
-  const processInbox = async () => {
-    let files: string[]
-    try { files = readdirSync(routerInbox).filter(f => f.endsWith('.json')).sort() } catch { return }
-    for (const f of files) {
-      const fp = join(routerInbox, f)
+  // Worker mode: connect to router via Unix socket, receive messages
+  dbg(`worker mode: connecting to ${ROUTER_SOCK}`)
+  let sockBuf = ''
+  const sock = netConnect(ROUTER_SOCK, () => {
+    dbg('worker: connected to router')
+    sock.write(JSON.stringify({ type: 'register', workdir: process.cwd() }) + '\n')
+  })
+  sock.on('data', (chunk) => {
+    sockBuf += chunk.toString()
+    let idx: number
+    while ((idx = sockBuf.indexOf('\n')) !== -1) {
+      const line = sockBuf.slice(0, idx)
+      sockBuf = sockBuf.slice(idx + 1)
+      if (!line.trim()) continue
       try {
-        const data = JSON.parse(readFileSync(fp, 'utf8'))
-        rmSync(fp, { force: true })
+        const data = JSON.parse(line)
         if (data.type === 'channel_message') {
-          dbg(`worker: delivering message from ${data.meta?.user}`)
-          await mcp.notification({ method: 'notifications/claude/channel', params: { content: data.content, meta: data.meta } })
+          dbg(`worker: message from ${data.meta?.user}`)
+          mcp.notification({ method: 'notifications/claude/channel', params: { content: data.content, meta: data.meta } }).catch(e => dbg(`deliver failed: ${e}`))
         } else if (data.type === 'permission_response') {
           dbg(`worker: permission ${data.behavior} for ${data.request_id}`)
-          await mcp.notification({ method: 'notifications/claude/channel/permission', params: { request_id: data.request_id, behavior: data.behavior } })
+          mcp.notification({ method: 'notifications/claude/channel/permission', params: { request_id: data.request_id, behavior: data.behavior } }).catch(e => dbg(`deliver failed: ${e}`))
         } else if (data.type === 'confirm_response') {
           dbg(`worker: confirm ${data.content}`)
-          await mcp.notification({ method: 'notifications/claude/channel', params: { content: data.content, meta: data.meta } })
+          mcp.notification({ method: 'notifications/claude/channel', params: { content: data.content, meta: data.meta } }).catch(e => dbg(`deliver failed: ${e}`))
         }
-      } catch (e) { dbg(`worker: failed to process ${f}: ${e}`); rmSync(fp, { force: true }) }
+      } catch (e) { dbg(`worker: bad message: ${e}`) }
     }
-  }
-
-  watch(routerInbox, () => { processInbox().catch(e => dbg(`worker inbox error: ${e}`)) })
-  setInterval(() => { processInbox().catch(e => dbg(`worker poll error: ${e}`)) }, 2000).unref()
-  processInbox().catch(() => {})
+  })
+  sock.on('error', (e) => dbg(`worker: socket error: ${e}`))
+  sock.on('close', () => dbg('worker: router disconnected'))
 } else if (CHANNEL_MODE) {
   await fetchBotOpenId()
   wsClient = new lark.WSClient({ appId: APP_ID, appSecret: APP_SECRET, loggerLevel: lark.LoggerLevel.warn })
