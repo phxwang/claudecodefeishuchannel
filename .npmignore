@@ -1,0 +1,8 @@
+*.png
+*.jpg
+.mcp.json
+.claude/
+.playwright-mcp/
+bun.lock
+node_modules/
+server.test.ts
