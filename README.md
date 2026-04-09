@@ -69,7 +69,13 @@ claude plugin install feishu@feishu-local
 
 ### 3. Start Claude Code with the Feishu Channel
 
-The Feishu channel is a development channel plugin. Launch Claude Code with:
+After installation, a `claude-feishu` shortcut is available (symlinked to `~/.local/bin` on first run). Use either:
+
+```bash
+claude-feishu
+```
+
+or the full command:
 
 ```bash
 claude --dangerously-load-development-channels plugin:feishu@feishu-local
@@ -270,6 +276,14 @@ The plugin detects whether it's running under a Feishu channel Claude instance b
 ### Orphan Protection
 
 When the parent Claude process exits, the plugin detects the ppid change within 2 seconds and shuts down gracefully. This prevents orphaned `bun server.ts` processes from consuming 100% CPU — a workaround for Bun not reliably firing stdin `end`/`close` events on broken unix domain sockets.
+
+## Testing
+
+```bash
+bun test
+```
+
+Tests cover access control (gate logic), text chunking, mention detection, permission reply parsing, confirm code generation, chat authorization, and router workdir resolution.
 
 ## Security
 
