@@ -1,21 +1,21 @@
 #!/usr/bin/env bun
 /**
- * Feishu Router — spawns a dedicated Claude Code instance per chat group.
+ * Feishu Router — central message hub for multiple Claude Code instances.
  *
- * Single Feishu WebSocket connection, routes messages by chat_id.
- * Each group gets its own Claude process with an isolated conversation context.
+ * Maintains the single Feishu WebSocket connection. Workers (server.ts in each
+ * Claude Code instance) connect via a Unix socket and register their cwd.
+ * Messages are routed by:  chat_id → workdir (access.json) → registered worker.
  *
  * Usage:  bun router.ts
- * Config: ~/.claude/channels/feishu/access.json  (groups.<chatId>.workdir)
+ * Config: ~/.claude/channels/feishu/access.json  (groups.<chatId>.workdir, defaultWorkdir)
  */
 import * as lark from '@larksuiteoapi/node-sdk'
-import { spawn, type ChildProcess } from 'child_process'
+import { createServer, type Socket } from 'net'
 import {
-  readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync,
-  chmodSync, renameSync,
+  readFileSync, appendFileSync, mkdirSync, chmodSync, unlinkSync, existsSync,
 } from 'fs'
 import { homedir } from 'os'
-import { join } from 'path'
+import { join, resolve } from 'path'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -23,7 +23,7 @@ const STATE_DIR = process.env.FEISHU_STATE_DIR ?? join(homedir(), '.claude', 'ch
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const ENV_FILE = join(STATE_DIR, '.env')
 const DEBUG_LOG = join(STATE_DIR, 'router-debug.log')
-const ROUTER_DIR = join(STATE_DIR, 'router')
+const SOCK_PATH = join(STATE_DIR, 'router.sock')
 
 function dbg(msg: string) {
   const line = `${new Date().toISOString()} [router] ${msg}\n`
@@ -51,7 +51,7 @@ if (!APP_ID || !APP_SECRET) {
 
 // ── Access control ──────────────────────────────────────────────────────────
 
-type GroupPolicy = { requireMention: boolean; allowFrom: string[]; workdir?: string; idleTimeout?: number }
+type GroupPolicy = { requireMention: boolean; allowFrom: string[]; workdir?: string }
 type Access = {
   dmPolicy: 'pairing' | 'allowlist' | 'disabled'
   allowFrom: string[]
@@ -102,102 +102,93 @@ function checkMention(mentions: any[], text: string, patterns?: string[]): boole
   return false
 }
 
-// ── Instance management ─────────────────────────────────────────────────────
+// ── Worker registry (Unix socket) ───────────────────────────────────────────
 
-type Instance = {
-  chatId: string
-  proc: ChildProcess
-  lastActivity: number
-  workdir: string
-}
+type Worker = { socket: Socket; workdir: string; buf: string }
 
-const instances = new Map<string, Instance>()
-const DEFAULT_IDLE_TIMEOUT = 30 * 60 * 1000 // 30 min
+const workers = new Map<Socket, Worker>()
 
-function writeMessage(chatId: string, payload: Record<string, unknown>) {
-  const dir = join(ROUTER_DIR, chatId)
-  mkdirSync(dir, { recursive: true })
-  const file = join(dir, `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`)
-  const tmp = file + '.tmp'
-  writeFileSync(tmp, JSON.stringify(payload) + '\n')
-  renameSync(tmp, file)
-}
-
-function spawnClaude(chatId: string, workdir: string): Instance {
-  dbg(`spawning claude for ${chatId} in ${workdir}`)
-  const proc = spawn('claude', [
-    '--dangerously-load-development-channels', 'plugin:feishu@feishu-local',
-  ], {
-    cwd: workdir,
-    env: { ...process.env, FEISHU_CHAT_ID: chatId },
-    stdio: ['pipe', 'pipe', 'pipe'],
-    detached: false,
-  })
-
-  proc.stdout?.on('data', (d: Buffer) => dbg(`[${chatId}] stdout: ${d.toString().trim()}`))
-  proc.stderr?.on('data', (d: Buffer) => dbg(`[${chatId}] stderr: ${d.toString().trim()}`))
-
-  proc.on('exit', (code, signal) => {
-    dbg(`claude for ${chatId} exited (code=${code}, signal=${signal})`)
-    instances.delete(chatId)
-  })
-
-  // Close stdin so claude enters non-interactive channel mode
-  proc.stdin?.end()
-
-  const inst: Instance = { chatId, proc, lastActivity: Date.now(), workdir }
-  instances.set(chatId, inst)
-  return inst
-}
-
-function ensureInstance(chatId: string, workdir: string): Instance {
-  const existing = instances.get(chatId)
-  if (existing && !existing.proc.killed) {
-    existing.lastActivity = Date.now()
-    return existing
+/** Find worker whose workdir matches the target. */
+function findWorker(workdir: string): Worker | undefined {
+  const target = resolve(workdir)
+  for (const w of workers.values()) {
+    if (resolve(w.workdir) === target) return w
   }
-  return spawnClaude(chatId, workdir)
+  return undefined
 }
 
-function killInstance(chatId: string) {
-  const inst = instances.get(chatId)
-  if (!inst) return
-  dbg(`killing claude for ${chatId}`)
-  inst.proc.kill('SIGTERM')
-  instances.delete(chatId)
+function sendToWorker(w: Worker, payload: Record<string, unknown>) {
+  try { w.socket.write(JSON.stringify(payload) + '\n') } catch (e) { dbg(`send failed: ${e}`) }
 }
 
-// Idle reaper
-setInterval(() => {
-  const access = readAccess()
-  const now = Date.now()
-  for (const [chatId, inst] of instances) {
-    const policy = access.groups[chatId]
-    const timeout = policy?.idleTimeout ?? DEFAULT_IDLE_TIMEOUT
-    if (now - inst.lastActivity > timeout) {
-      dbg(`idle timeout for ${chatId} (${Math.round((now - inst.lastActivity) / 1000)}s)`)
-      killInstance(chatId)
+/** Route a payload to the worker matching the given workdir. Returns true if delivered. */
+function routeToWorkdir(workdir: string, payload: Record<string, unknown>): boolean {
+  const w = findWorker(workdir)
+  if (!w) { dbg(`no worker for workdir ${workdir}`); return false }
+  sendToWorker(w, payload)
+  return true
+}
+
+/** Shut down router if no workers remain after a grace period. */
+let idleTimer: ReturnType<typeof setTimeout> | null = null
+const IDLE_GRACE_MS = 10_000  // wait 10s before shutting down
+
+function scheduleIdleShutdown() {
+  if (idleTimer) clearTimeout(idleTimer)
+  if (workers.size > 0) return
+  idleTimer = setTimeout(() => {
+    if (workers.size === 0) {
+      dbg('all workers disconnected, shutting down')
+      shutdown()
     }
-  }
-}, 30_000).unref()
+  }, IDLE_GRACE_MS)
+}
+
+const sockServer = createServer((socket) => {
+  if (idleTimer) { clearTimeout(idleTimer); idleTimer = null }
+  const w: Worker = { socket, workdir: '', buf: '' }
+  workers.set(socket, w)
+  dbg(`worker connected (${workers.size} total)`)
+
+  socket.on('data', (chunk) => {
+    w.buf += chunk.toString()
+    let idx: number
+    while ((idx = w.buf.indexOf('\n')) !== -1) {
+      const line = w.buf.slice(0, idx)
+      w.buf = w.buf.slice(idx + 1)
+      if (!line.trim()) continue
+      try {
+        const msg = JSON.parse(line)
+        if (msg.type === 'register' && msg.workdir) {
+          w.workdir = resolve(msg.workdir)
+          dbg(`worker registered: ${w.workdir}`)
+        }
+      } catch (e) { dbg(`bad message from worker: ${e}`) }
+    }
+  })
+
+  socket.on('close', () => {
+    workers.delete(socket)
+    dbg(`worker disconnected: ${w.workdir} (${workers.size} remaining)`)
+    scheduleIdleShutdown()
+  })
+
+  socket.on('error', (e) => {
+    dbg(`worker socket error: ${e}`)
+    workers.delete(socket)
+    scheduleIdleShutdown()
+  })
+})
 
 // ── Message routing ─────────────────────────────────────────────────────────
 
-function routeMessage(chatId: string, chatType: string, payload: Record<string, unknown>) {
+function resolveWorkdir(chatId: string, chatType: string): string | undefined {
   const access = readAccess()
-
-  let workdir: string | undefined
   if (chatType === 'group') {
-    workdir = access.groups[chatId]?.workdir
+    const wd = access.groups[chatId]?.workdir
+    if (wd) return wd
   }
-  workdir = workdir ?? access.defaultWorkdir
-  if (!workdir) {
-    dbg(`no workdir configured for ${chatId}, dropping`)
-    return
-  }
-
-  ensureInstance(chatId, workdir)
-  writeMessage(chatId, payload)
+  return access.defaultWorkdir
 }
 
 async function handleInbound(data: any) {
@@ -250,8 +241,11 @@ async function handleInbound(data: any) {
   const content = text || (atts.length ? '(attachment)' : '')
   if (!content) return
 
-  dbg(`routing message from ${senderId} in ${chatId} (${chatType})`)
-  routeMessage(chatId, chatType, {
+  const workdir = resolveWorkdir(chatId, chatType)
+  if (!workdir) { dbg(`no workdir for ${chatId}, dropping`); return }
+
+  dbg(`routing ${chatId} (${chatType}) → ${workdir}`)
+  routeToWorkdir(workdir, {
     type: 'channel_message',
     content,
     meta: {
@@ -270,17 +264,18 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
   const value = data?.action?.value ?? {}
   const code = value.code as string | undefined
   const action = value.action as string | undefined
-  const chatId = data?.open_chat_id ?? ''
   if (!code || !action) return {}
+
+  // Find the worker that sent this card — route by chat_id or broadcast
+  const chatId = data?.open_chat_id ?? ''
+  const workdir = chatId ? resolveWorkdir(chatId, 'group') ?? resolveWorkdir(chatId, 'p2p') : undefined
 
   if (action === 'perm_allow' || action === 'perm_deny') {
     const behavior = action === 'perm_deny' ? 'deny' : 'allow'
-    if (chatId) {
-      // Route to the instance for this chat
-      const access = readAccess()
-      const targetChat = Object.keys(access.groups).find(gid => instances.has(gid)) ?? chatId
-      writeMessage(targetChat, { type: 'permission_response', request_id: code, behavior })
-    }
+    const payload = { type: 'permission_response', request_id: code, behavior }
+    if (workdir) routeToWorkdir(workdir, payload)
+    else for (const w of workers.values()) sendToWorker(w, payload) // broadcast if unknown
+
     const statusText = behavior === 'allow' ? '✅ 已允许' : '❌ 已拒绝'
     return {
       toast: { type: behavior === 'deny' ? 'info' : 'success', content: statusText },
@@ -297,21 +292,21 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
 
   if (action === 'confirm' || action === 'cancel') {
     const isConfirm = action === 'confirm'
-    const targetChat = chatId || [...instances.keys()][0]
-    if (targetChat) {
-      writeMessage(targetChat, {
-        type: 'confirm_response',
-        content: isConfirm ? `CONFIRMED ${code}` : `CANCELLED ${code}`,
-        meta: {
-          chat_id: targetChat,
-          message_id: `card-${Date.now()}`,
-          user: 'system',
-          user_id: 'system',
-          ts: new Date().toISOString(),
-          chat_type: 'p2p',
-        },
-      })
+    const payload = {
+      type: 'confirm_response',
+      content: isConfirm ? `CONFIRMED ${code}` : `CANCELLED ${code}`,
+      meta: {
+        chat_id: chatId || 'system',
+        message_id: `card-${Date.now()}`,
+        user: 'system',
+        user_id: 'system',
+        ts: new Date().toISOString(),
+        chat_type: 'p2p',
+      },
     }
+    if (workdir) routeToWorkdir(workdir, payload)
+    else for (const w of workers.values()) sendToWorker(w, payload)
+
     const statusText = isConfirm ? '✅ 已确认' : '❌ 已取消'
     return {
       toast: { type: isConfirm ? 'success' : 'info', content: statusText },
@@ -332,8 +327,16 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
 // ── Startup ─────────────────────────────────────────────────────────────────
 
 dbg('router starting')
-mkdirSync(ROUTER_DIR, { recursive: true })
+mkdirSync(STATE_DIR, { recursive: true })
 await fetchBotOpenId()
+
+// Clean up stale socket
+if (existsSync(SOCK_PATH)) { try { unlinkSync(SOCK_PATH) } catch {} }
+
+sockServer.listen(SOCK_PATH, () => {
+  chmodSync(SOCK_PATH, 0o600)
+  dbg(`unix socket listening: ${SOCK_PATH}`)
+})
 
 const wsClient = new lark.WSClient({ appId: APP_ID, appSecret: APP_SECRET, loggerLevel: lark.LoggerLevel.warn })
 const dispatcher = new lark.EventDispatcher({ encryptKey: ENCRYPT_KEY }).register({
@@ -351,10 +354,9 @@ wsClient.start({ eventDispatcher: dispatcher }).catch(e => dbg(`wsClient error: 
 
 // Status on SIGUSR1
 process.on('SIGUSR1', () => {
-  const lines = [`\n=== Router Status ===`, `instances: ${instances.size}`]
-  for (const [chatId, inst] of instances) {
-    const idle = Math.round((Date.now() - inst.lastActivity) / 1000)
-    lines.push(`  ${chatId}: pid=${inst.proc.pid}, idle=${idle}s, cwd=${inst.workdir}`)
+  const lines = [`\n=== Router Status ===`, `workers: ${workers.size}`]
+  for (const w of workers.values()) {
+    lines.push(`  ${w.workdir}`)
   }
   dbg(lines.join('\n'))
 })
@@ -362,15 +364,18 @@ process.on('SIGUSR1', () => {
 let shuttingDown = false
 function shutdown() {
   if (shuttingDown) return; shuttingDown = true
-  dbg('shutting down — killing all instances')
-  for (const [chatId] of instances) killInstance(chatId)
+  dbg('shutting down')
+  sockServer.close()
+  try { unlinkSync(SOCK_PATH) } catch {}
   try { (wsClient as any).disconnect?.() } catch {}
-  setTimeout(() => process.exit(0), 3000)
+  setTimeout(() => process.exit(0), 2000)
 }
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
-dbg(`router ready — ${Object.keys(readAccess().groups).length} groups configured`)
+const access = readAccess()
+const groupCount = Object.keys(access.groups).length
+dbg(`router ready — ${groupCount} groups, defaultWorkdir=${access.defaultWorkdir ?? '(none)'}`)
 
 // Keep alive
 await new Promise(() => {})

@@ -69,7 +69,13 @@ claude plugin install feishu@feishu-local
 
 ### 3. Start Claude Code with the Feishu Channel
 
-The Feishu channel is a development channel plugin. Launch Claude Code with:
+After installation, a `claude-feishu` shortcut is available (symlinked to `~/.local/bin` on first run). Use either:
+
+```bash
+claude-feishu
+```
+
+or the full command:
 
 ```bash
 claude --dangerously-load-development-channels plugin:feishu@feishu-local
@@ -104,7 +110,16 @@ You're ready — send messages to the bot and Claude will respond.
 
 ## Multi-Group Router
 
-For multiple Feishu groups that each need an isolated Claude Code instance, use the **router**. It maintains a single Feishu WebSocket connection and spawns a dedicated Claude process per group.
+For multiple Feishu groups that each need an isolated Claude Code instance, use the **router**. It maintains a single Feishu WebSocket connection and routes messages to Claude instances via a Unix socket.
+
+### Architecture
+
+```
+                             ┌─ server.ts (cwd=project-a) ─ Claude Code
+Feishu WebSocket → router ───┤─ server.ts (cwd=project-b) ─ Claude Code
+               (Unix socket) └─ server.ts (cwd=project-c) ─ Claude Code
+                                  ▲ workers auto-connect on startup
+```
 
 ### 1. Configure Group Workdirs
 
@@ -124,34 +139,32 @@ Add `workdir` to each group in `~/.claude/channels/feishu/access.json`:
       "workdir": "/path/to/project-b"
     }
   },
-  "defaultWorkdir": "/path/to/default-project"  // for DMs
+  "defaultWorkdir": "/path/to/default-project"  // DMs route here
 }
 ```
 
-### 2. Start the Router
+### 2. Start Claude Code Instances
+
+In separate terminals, start Claude in each project directory:
 
 ```bash
-cd /path/to/feishuchannel
-bun run router
+cd /path/to/project-a
+claude-feishu
+
+cd /path/to/project-b
+claude-feishu
 ```
 
-The router will:
-- Connect to Feishu WebSocket (single connection)
-- Spawn a Claude instance per group on first message
-- Route messages to the correct instance by `chat_id`
-- Recycle idle instances after 30 minutes (configurable via `idleTimeout` per group)
+The **first** Claude instance automatically spawns the router as a background process. Subsequent instances detect the router socket and connect as workers. The router matches incoming messages by `chat_id → workdir → connected worker`.
 
-### 3. Check Status
+> **Manual router start** (optional): If you prefer to manage the router yourself, run `bun run router` in the plugin directory before starting any Claude instances.
 
-Send `SIGUSR1` to the router process to dump instance status:
+### 4. Check Status
 
 ```bash
 kill -USR1 $(pgrep -f 'bun router.ts')
+cat ~/.claude/channels/feishu/router-debug.log | tail -10
 ```
-
-Check `~/.claude/channels/feishu/router-debug.log` for router logs.
-
-> **Note:** When using the router, do NOT start Claude with `--dangerously-load-development-channels` separately — the router handles spawning.
 
 ## Access Management
 
@@ -258,6 +271,14 @@ The plugin detects whether it's running under a Feishu channel Claude instance b
 ### Orphan Protection
 
 When the parent Claude process exits, the plugin detects the ppid change within 2 seconds and shuts down gracefully. This prevents orphaned `bun server.ts` processes from consuming 100% CPU — a workaround for Bun not reliably firing stdin `end`/`close` events on broken unix domain sockets.
+
+## Testing
+
+```bash
+bun test
+```
+
+Tests cover access control (gate logic), text chunking, mention detection, permission reply parsing, confirm code generation, chat authorization, and router workdir resolution.
 
 ## Security
 

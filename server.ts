@@ -10,17 +10,19 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import { z } from 'zod'
 import * as lark from '@larksuiteoapi/node-sdk'
 import { randomBytes } from 'crypto'
-import { execSync } from 'child_process'
+import { execSync, spawn } from 'child_process'
+import { connect as netConnect } from 'net'
 import {
   readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync,
-  statSync, renameSync, realpathSync, chmodSync, createReadStream, watch,
+  statSync, renameSync, realpathSync, chmodSync, createReadStream, existsSync,
 } from 'fs'
 import { homedir } from 'os'
 import { join, sep, extname, basename } from 'path'
 
-function ancestorHasChannelArg(): boolean {
+/** Walk up the process tree to find the Claude ancestor with --channels feishu.
+ *  Returns its PID (or 0 if not found). */
+function findChannelAncestorPid(): number {
   try {
-    // Walk up the process tree: server.ts → bun run → claude
     const lines = execSync(
       `ps -o pid=,ppid=,args= -ax`,
       { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 },
@@ -34,18 +36,64 @@ function ancestorHasChannelArg(): boolean {
     for (let depth = 0; depth < 5; depth++) {
       const p = byPid.get(pid)
       if (!p) break
-      if (/\bchannels?\b/.test(p.args) && /\bfeishu\b/.test(p.args)) return true
+      if (/\bchannels?\b/.test(p.args) && /\bfeishu\b/.test(p.args)) return pid
       pid = p.ppid
       if (pid <= 1) break
     }
   } catch {}
-  return false
+  return 0
 }
-const CHANNEL_MODE = ancestorHasChannelArg()
-const WORKER_CHAT_ID = process.env.FEISHU_CHAT_ID ?? ''
-const WORKER_MODE = !!WORKER_CHAT_ID
+
+/** Get the cwd of a process by PID (macOS: lsof, Linux: /proc). */
+function getProcessCwd(pid: number): string | undefined {
+  try {
+    // macOS
+    const out = execSync(`lsof -a -p ${pid} -d cwd -Fn 2>/dev/null`, { encoding: 'utf8' })
+    const m = out.match(/^n(.+)$/m)
+    if (m) return m[1]
+  } catch {}
+  try {
+    // Linux fallback
+    return readFileSync(`/proc/${pid}/cwd`, 'utf8')
+  } catch {}
+  return undefined
+}
+
+const CHANNEL_ANCESTOR_PID = findChannelAncestorPid()
+const CHANNEL_MODE = CHANNEL_ANCESTOR_PID > 0
+const CLAUDE_WORKDIR = CHANNEL_MODE ? getProcessCwd(CHANNEL_ANCESTOR_PID) : undefined
 
 const STATE_DIR = process.env.FEISHU_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'feishu')
+const ROUTER_SOCK = join(STATE_DIR, 'router.sock')
+const PLUGIN_DIR = import.meta.dir  // plugin cache directory containing router.ts
+
+/** Spawn router as detached background process if not already running. */
+function ensureRouter(): boolean {
+  if (existsSync(ROUTER_SOCK)) return true
+  const routerScript = join(PLUGIN_DIR, 'router.ts')
+  if (!existsSync(routerScript)) { dbg(`router.ts not found at ${routerScript}`); return false }
+  dbg(`spawning router: bun ${routerScript}`)
+  const child = spawn('bun', [routerScript], {
+    detached: true,
+    stdio: 'ignore',
+    env: { ...process.env },
+  })
+  child.unref()
+  dbg(`router spawned (pid=${child.pid})`)
+  return true
+}
+
+/** Wait for router.sock to appear, up to timeoutMs. */
+async function waitForSocket(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (existsSync(ROUTER_SOCK)) return true
+    await new Promise(r => setTimeout(r, 200))
+  }
+  return false
+}
+
+let WORKER_MODE = CHANNEL_MODE && existsSync(ROUTER_SOCK)
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -230,7 +278,7 @@ function checkApprovals() {
     })()
   }
 }
-if (!STATIC && (CHANNEL_MODE || WORKER_MODE)) setInterval(checkApprovals, 5000).unref()
+if (!STATIC && CHANNEL_MODE) setInterval(checkApprovals, 5000).unref()
 
 function chunkText(text: string, limit: number): string[] {
   if (text.length <= limit) return [text]
@@ -677,42 +725,54 @@ async function handleInbound(data: any) {
   }).then(() => dbg('notification sent ok')).catch(e => dbg(`deliver failed: ${e}`))
 }
 
-// Startup
-dbg(`server starting (CHANNEL_MODE=${CHANNEL_MODE}, WORKER_MODE=${WORKER_MODE}, ppid=${process.ppid})`)
+// Startup — auto-launch router if needed
+if (CHANNEL_MODE && !WORKER_MODE) {
+  if (ensureRouter()) {
+    const ok = await waitForSocket(5000)
+    if (ok) { WORKER_MODE = true; dbg('router auto-started, switching to worker mode') }
+    else dbg('router socket did not appear in time, falling back to direct WebSocket')
+  }
+}
+
+dbg(`server starting (CHANNEL_MODE=${CHANNEL_MODE}, WORKER_MODE=${WORKER_MODE}, ppid=${process.ppid}, workdir=${CLAUDE_WORKDIR ?? process.cwd()})`)
 
 let wsClient: lark.WSClient | null = null
 
-if (WORKER_MODE) {
-  // Worker mode: read messages from router inbox, not from WebSocket
-  const routerInbox = join(STATE_DIR, 'router', WORKER_CHAT_ID)
-  mkdirSync(routerInbox, { recursive: true })
-  dbg(`worker mode: watching ${routerInbox}`)
-
-  const processInbox = async () => {
-    let files: string[]
-    try { files = readdirSync(routerInbox).filter(f => f.endsWith('.json')).sort() } catch { return }
-    for (const f of files) {
-      const fp = join(routerInbox, f)
+function connectWorker() {
+  dbg(`worker mode: connecting to ${ROUTER_SOCK}`)
+  let sockBuf = ''
+  const sock = netConnect(ROUTER_SOCK, () => {
+    dbg('worker: connected to router')
+    sock.write(JSON.stringify({ type: 'register', workdir: CLAUDE_WORKDIR ?? process.cwd() }) + '\n')
+  })
+  sock.on('data', (chunk) => {
+    sockBuf += chunk.toString()
+    let idx: number
+    while ((idx = sockBuf.indexOf('\n')) !== -1) {
+      const line = sockBuf.slice(0, idx)
+      sockBuf = sockBuf.slice(idx + 1)
+      if (!line.trim()) continue
       try {
-        const data = JSON.parse(readFileSync(fp, 'utf8'))
-        rmSync(fp, { force: true })
+        const data = JSON.parse(line)
         if (data.type === 'channel_message') {
-          dbg(`worker: delivering message from ${data.meta?.user}`)
-          await mcp.notification({ method: 'notifications/claude/channel', params: { content: data.content, meta: data.meta } })
+          dbg(`worker: message from ${data.meta?.user}`)
+          mcp.notification({ method: 'notifications/claude/channel', params: { content: data.content, meta: data.meta } }).catch(e => dbg(`deliver failed: ${e}`))
         } else if (data.type === 'permission_response') {
           dbg(`worker: permission ${data.behavior} for ${data.request_id}`)
-          await mcp.notification({ method: 'notifications/claude/channel/permission', params: { request_id: data.request_id, behavior: data.behavior } })
+          mcp.notification({ method: 'notifications/claude/channel/permission', params: { request_id: data.request_id, behavior: data.behavior } }).catch(e => dbg(`deliver failed: ${e}`))
         } else if (data.type === 'confirm_response') {
           dbg(`worker: confirm ${data.content}`)
-          await mcp.notification({ method: 'notifications/claude/channel', params: { content: data.content, meta: data.meta } })
+          mcp.notification({ method: 'notifications/claude/channel', params: { content: data.content, meta: data.meta } }).catch(e => dbg(`deliver failed: ${e}`))
         }
-      } catch (e) { dbg(`worker: failed to process ${f}: ${e}`); rmSync(fp, { force: true }) }
+      } catch (e) { dbg(`worker: bad message: ${e}`) }
     }
-  }
+  })
+  sock.on('error', (e) => dbg(`worker: socket error: ${e}`))
+  sock.on('close', () => dbg('worker: router disconnected'))
+}
 
-  watch(routerInbox, () => { processInbox().catch(e => dbg(`worker inbox error: ${e}`)) })
-  setInterval(() => { processInbox().catch(e => dbg(`worker poll error: ${e}`)) }, 2000).unref()
-  processInbox().catch(() => {})
+if (WORKER_MODE) {
+  connectWorker()
 } else if (CHANNEL_MODE) {
   await fetchBotOpenId()
   wsClient = new lark.WSClient({ appId: APP_ID, appSecret: APP_SECRET, loggerLevel: lark.LoggerLevel.warn })
