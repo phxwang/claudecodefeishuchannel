@@ -98,7 +98,7 @@ Map Feishu groups to project directories in `~/.claude/channels/feishu/access.js
 Clone the repository:
 
 ```bash
-git clone git@github.com:phxwang/feishuclaudecode.git
+git clone https://github.com/phxwang/feishuchannel-for-claudecode.git
 ```
 
 Register the local directory as a plugin marketplace, then install the plugin:
