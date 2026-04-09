@@ -4,8 +4,49 @@ A [Feishu (Lark)](https://www.feishu.cn/) channel plugin for [Claude Code](https
 
 Uses the MCP Channel protocol to integrate Feishu as a first-class messaging channel for Claude Code, with **WebSocket persistent connection** mode requiring no public HTTPS endpoint.
 
+## Multi-Group Router — One Bot, Many Projects
+
+The killer feature: **route different Feishu groups to different Claude Code instances**, each working in its own project directory. A single Feishu bot serves your entire team — each group gets its own isolated Claude with full project context.
+
+```
+                             ┌─ Claude Code (project-a)
+Feishu Bot ──→ Router ───────┤─ Claude Code (project-b)
+           (single WebSocket)└─ Claude Code (project-c)
+                                  ▲ auto-connect via Unix socket
+```
+
+**How it works:**
+- The **router** holds the single Feishu WebSocket connection and routes messages by `chat_id → workdir → worker`
+- Each **worker** (server.ts) runs inside a Claude Code instance, registered by its working directory
+- The first `claude-feishu` launch **auto-spawns the router** — no manual setup needed
+- When all workers disconnect, the router **auto-shuts down** after a grace period
+
+**Zero-config startup** — just run `claude-feishu` in each project directory:
+
+```bash
+cd /path/to/project-a && claude-feishu   # spawns router + connects as worker
+cd /path/to/project-b && claude-feishu   # connects to existing router
+cd /path/to/project-c && claude-feishu   # connects to existing router
+```
+
+Map Feishu groups to project directories in `~/.claude/channels/feishu/access.json`:
+
+```jsonc
+{
+  "groups": {
+    "oc_groupA": { "workdir": "/path/to/project-a", ... },
+    "oc_groupB": { "workdir": "/path/to/project-b", ... }
+  },
+  "defaultWorkdir": "/path/to/default-project"  // DMs route here
+}
+```
+
+> See [Multi-Group Router Setup](#multi-group-router-setup) for full configuration details.
+
 ## Features
 
+- **Multi-group routing** — One Feishu bot serves multiple Claude Code instances, each in its own project
+- **Auto-managed router** — Router spawns on first launch, shuts down when all workers disconnect
 - **Direct messages** — Chat with Claude through Feishu DMs
 - **Group chats** — Add the bot to group chats with @mention support
 - **Access control** — Pairing-based onboarding, allowlists, and per-group policies
@@ -13,8 +54,8 @@ Uses the MCP Channel protocol to integrate Feishu as a first-class messaging cha
 - **Permission cards** — Interactive approve/deny cards for tool permission requests
 - **Attachments** — Send and receive files and images
 - **Reactions** — Configurable emoji reactions on message receipt
-- **Smart connection** — Only connects to Feishu WebSocket when launched as a channel, avoiding unnecessary connections from non-channel Claude instances
-- **Graceful shutdown** — Detects parent process exit via ppid polling, preventing orphaned processes and 100% CPU loops
+- **Smart connection** — Only connects when launched as a channel, skipping unnecessary connections
+- **Graceful shutdown** — Detects parent process exit via ppid polling, preventing orphaned processes
 
 ## Prerequisites
 
@@ -108,18 +149,7 @@ Credentials are stored in `~/.claude/channels/feishu/.env` (mode 600).
 
 You're ready — send messages to the bot and Claude will respond.
 
-## Multi-Group Router
-
-For multiple Feishu groups that each need an isolated Claude Code instance, use the **router**. It maintains a single Feishu WebSocket connection and routes messages to Claude instances via a Unix socket.
-
-### Architecture
-
-```
-                             ┌─ server.ts (cwd=project-a) ─ Claude Code
-Feishu WebSocket → router ───┤─ server.ts (cwd=project-b) ─ Claude Code
-               (Unix socket) └─ server.ts (cwd=project-c) ─ Claude Code
-                                  ▲ workers auto-connect on startup
-```
+## Multi-Group Router Setup
 
 ### 1. Configure Group Workdirs
 
@@ -155,11 +185,11 @@ cd /path/to/project-b
 claude-feishu
 ```
 
-The **first** Claude instance automatically spawns the router as a background process. Subsequent instances detect the router socket and connect as workers. The router matches incoming messages by `chat_id → workdir → connected worker`.
+The **first** instance auto-spawns the router. Subsequent instances connect as workers. The router matches incoming messages by `chat_id → workdir → connected worker`.
 
-> **Manual router start** (optional): If you prefer to manage the router yourself, run `bun run router` in the plugin directory before starting any Claude instances.
+> **Manual router start** (optional): Run `bun run router` in the plugin directory before starting any Claude instances.
 
-### 4. Check Status
+### 3. Check Status
 
 ```bash
 kill -USR1 $(pgrep -f 'bun router.ts')
