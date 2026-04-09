@@ -10,8 +10,11 @@ Uses the MCP Channel protocol to integrate Feishu as a first-class messaging cha
 - **Group chats** — Add the bot to group chats with @mention support
 - **Access control** — Pairing-based onboarding, allowlists, and per-group policies
 - **Confirm cards** — Interactive confirmation cards for risky actions
+- **Permission cards** — Interactive approve/deny cards for tool permission requests
 - **Attachments** — Send and receive files and images
 - **Reactions** — Configurable emoji reactions on message receipt
+- **Smart connection** — Only connects to Feishu WebSocket when launched as a channel, avoiding unnecessary connections from non-channel Claude instances
+- **Graceful shutdown** — Detects parent process exit via ppid polling, preventing orphaned processes and 100% CPU loops
 
 ## Prerequisites
 
@@ -190,6 +193,16 @@ Groups are off by default. The bot must be added to the group by a group admin f
 | `FEISHU_ENCRYPT_KEY` | No | Event payload encryption key |
 | `FEISHU_ACCESS_MODE` | No | Set to `static` to disable pairing |
 | `FEISHU_STATE_DIR` | No | Override state directory path |
+
+## How It Works
+
+### Smart Connection
+
+The plugin detects whether it's running under a Feishu channel Claude instance by walking up the process tree and checking for `--dangerously-load-development-channels` with `feishu` in the ancestor's command line. Non-channel Claude instances (e.g., regular `claude` or `claude --channels plugin:discord@...`) skip the Feishu WebSocket connection entirely, keeping the MCP tools available without unnecessary remote connections.
+
+### Orphan Protection
+
+When the parent Claude process exits, the plugin detects the ppid change within 2 seconds and shuts down gracefully. This prevents orphaned `bun server.ts` processes from consuming 100% CPU — a workaround for Bun not reliably firing stdin `end`/`close` events on broken unix domain sockets.
 
 ## Security
 
