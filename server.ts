@@ -706,4 +706,14 @@ process.stdin.on('close', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
+// Bun doesn't reliably fire stdin end/close on broken unix domain sockets,
+// so poll ppid — when it becomes 1 the parent (Claude) has exited.
+const initialPpid = process.ppid
+setInterval(() => {
+  if (process.ppid !== initialPpid) {
+    dbg(`parent changed (${initialPpid} → ${process.ppid}), exiting`)
+    shutdown()
+  }
+}, 2000).unref()
+
 await mcpPromise
