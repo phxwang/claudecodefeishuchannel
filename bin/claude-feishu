@@ -1,2 +1,21 @@
 #!/bin/bash
-exec claude --dangerously-load-development-channels plugin:feishu@feishu-local "$@"
+# Launch Claude Code with Feishu channel.
+# Auto-resumes a session whose name ends with the current directory name.
+# Falls back to the interactive session picker if no match is found.
+
+CHANNEL_FLAG="--dangerously-load-development-channels plugin:feishu@feishu-local"
+DIR_NAME=$(basename "$(pwd)")
+PROJECT_KEY=$(pwd | sed 's|/|-|g')
+PROJECT_DIR="$HOME/.claude/projects/$PROJECT_KEY"
+
+# Search for a session with a customTitle ending in the directory name
+MATCH=""
+if [ -d "$PROJECT_DIR" ]; then
+  MATCH=$(grep -rl "\"customTitle\":\".*${DIR_NAME}\"" "$PROJECT_DIR"/*.jsonl 2>/dev/null | tail -1)
+fi
+
+if [ -n "$MATCH" ]; then
+  exec claude --resume "$DIR_NAME" $CHANNEL_FLAG "$@"
+else
+  exec claude --resume $CHANNEL_FLAG "$@"
+fi
