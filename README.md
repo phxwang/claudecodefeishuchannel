@@ -59,6 +59,7 @@ Map Feishu groups to project directories in `~/.claude/channels/feishu/access.js
 - **Access control** — Pairing-based onboarding, allowlists, and per-group policies
 - **Confirm cards** — Interactive confirmation cards for risky actions
 - **Permission cards** — Interactive approve/deny cards for tool permission requests
+- **Unanswered reminders** — Auto-nudges Claude if a message goes unanswered for 30+ minutes (up to 3 times, escalating intervals)
 - **Attachments** — Send and receive files and images
 - **Reactions** — Configurable emoji reactions on message receipt
 - **Smart connection** — Only connects when launched as a channel, skipping unnecessary connections
