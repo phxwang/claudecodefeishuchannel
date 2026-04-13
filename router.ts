@@ -259,7 +259,7 @@ async function handleInbound(data: any) {
     },
   })
   if (!delivered) {
-    const hint = `⚠️ 该群绑定的项目 \`${workdir}\` 还没有启动 Claude Code 会话。请在该目录下运行 \`claude-feishu\` 后再发消息。`
+    const hint = `⚠️ No active Claude Code session for \`${workdir}\`. Please run \`claude-feishu\` in that directory, then send your message again.`
     void (apiClient as any).im.message.reply({
       path: { message_id: messageId },
       data: { msg_type: 'text', content: JSON.stringify({ text: hint }), reply_in_thread: false },
