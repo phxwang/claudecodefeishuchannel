@@ -251,6 +251,23 @@ function gate(senderId: string, chatId: string, chatType: string, mentioned: boo
   return { action: 'deliver', access: a }
 }
 
+/** Fetch the parent message's text so replies keep context when delivered. */
+async function fetchParentQuote(parentId: string): Promise<string> {
+  try {
+    const r = await (apiClient as any).im.message.get({ path: { message_id: parentId } })
+    const items: any[] = r?.items ?? r?.data?.items ?? []
+    if (!items.length) return ''
+    const m = items[0]
+    const raw: string = m.body?.content ?? m.content ?? ''
+    let txt = raw
+    try { txt = JSON.parse(raw).text ?? raw } catch {}
+    const mtype: string = m.msg_type ?? m.message_type ?? ''
+    const who: string = m.sender?.id ?? m.sender?.sender_id ?? ''
+    const preview = (txt || `[${mtype}]`).replace(/\s+/g, ' ').trim().slice(0, 500)
+    return `> [replying to ${who}]: ${preview}\n\n`
+  } catch (e) { dbg(`fetchParentQuote failed: ${e}`); return '' }
+}
+
 function checkMention(mentions: any[], text: string, extra?: string[]): boolean {
   for (const m of mentions) {
     if (m.mentioned_type === 'bot') return true
@@ -730,7 +747,28 @@ async function handleInbound(data: any) {
   if (!senderId || !chatId || !messageId) { dbg(`drop: missing ids senderId=${senderId} chatId=${chatId} messageId=${messageId}`); return }
 
   let text = ''
-  try { text = JSON.parse(contentStr).text ?? '' } catch { text = contentStr }
+  const postImageKeys: string[] = []
+  try {
+    const parsed = JSON.parse(contentStr)
+    if (msgType === 'post') {
+      // Post messages nest text+images in a 2D array: {title, content: [[{tag,text|image_key}]]}
+      if (parsed.title) text += parsed.title
+      const rows: any[] = Array.isArray(parsed.content) ? parsed.content : []
+      for (const row of rows) {
+        if (!Array.isArray(row)) continue
+        const parts: string[] = []
+        for (const seg of row) {
+          if (seg?.tag === 'text' && seg.text) parts.push(seg.text)
+          else if (seg?.tag === 'a' && seg.text) parts.push(`${seg.text}(${seg.href ?? ''})`)
+          else if (seg?.tag === 'at' && (seg.user_name ?? seg.user_id)) parts.push(`@${seg.user_name ?? seg.user_id}`)
+          else if (seg?.tag === 'img' && seg.image_key) postImageKeys.push(seg.image_key)
+        }
+        if (parts.length) text += (text ? '\n' : '') + parts.join(' ')
+      }
+    } else {
+      text = parsed.text ?? ''
+    }
+  } catch { text = contentStr }
 
   const access = loadAccess()
   if (mentions.length > 0) dbg(`mentions: ${JSON.stringify(mentions)}, botOpenId=${botOpenId}`)
@@ -773,16 +811,21 @@ async function handleInbound(data: any) {
   const atts: string[] = []
   if (msgType === 'file') { try { const c = JSON.parse(contentStr); atts.push(`${c.file_name ?? 'file'} (file, key:${c.file_key ?? ''})`) } catch {} }
   else if (msgType === 'image') { try { const c = JSON.parse(contentStr); atts.push(`image (image/jpeg, key:${c.image_key ?? ''})`) } catch {} }
+  for (const k of postImageKeys) atts.push(`image (image/jpeg, key:${k})`)
 
   const ts = createTime ? new Date(parseInt(createTime) > 1e12 ? parseInt(createTime) : parseInt(createTime) * 1000).toISOString() : new Date().toISOString()
-  const content = text || (atts.length ? '(attachment)' : '')
-  dbg(`content="${content}" text="${text}" atts=${atts.length}`)
+
+  const parentId: string = (message as any).parent_id ?? ''
+  const quotePrefix = parentId ? await fetchParentQuote(parentId) : ''
+  const body = text || (atts.length ? '(attachment)' : '')
+  const content = quotePrefix + body
+  dbg(`content="${content}" text="${text}" atts=${atts.length} parent=${parentId || '-'}`)
   if (!content) { dbg('drop: empty content'); return }
 
   dbg('sending mcp.notification')
   mcp.notification({
     method: 'notifications/claude/channel',
-    params: { content, meta: { chat_id: chatId, message_id: messageId, user: senderId, user_id: senderId, ts, chat_type: chatType, ...(atts.length ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}) } },
+    params: { content, meta: { chat_id: chatId, message_id: messageId, user: senderId, user_id: senderId, ts, chat_type: chatType, ...(parentId ? { parent_id: parentId } : {}), ...(atts.length ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}) } },
   }).then(() => dbg('notification sent ok')).catch(e => dbg(`deliver failed: ${e}`))
   trackUnanswered(chatId, senderId, chatType, content)
 }
