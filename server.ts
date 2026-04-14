@@ -787,6 +787,115 @@ async function handleInbound(data: any) {
   trackUnanswered(chatId, senderId, chatType, content)
 }
 
+// ── Rate-limit detection via transcript tail ────────────────────────────────
+// Claude Code writes every event to ~/.claude/projects/<dashed-cwd>/<session>.jsonl.
+// When the 5-hour quota is hit, a synthetic assistant message lands with
+// error:"rate_limit" + isApiErrorMessage:true. We tail that file and notify
+// the user via Feishu so the session isn't silently stuck.
+
+const TRANSCRIPT_POLL_MS = 2_000
+const notifiedRateLimitUuids = new Set<string>()
+let transcriptPath: string | null = null
+let transcriptOffset = 0
+let transcriptBuf = ''
+
+function projectDirForCwd(cwd: string): string {
+  return join(homedir(), '.claude', 'projects', cwd.replace(/\//g, '-'))
+}
+
+function findLatestTranscript(projectDir: string): string | null {
+  try {
+    const files = readdirSync(projectDir)
+      .filter(f => f.endsWith('.jsonl'))
+      .map(f => {
+        const p = join(projectDir, f)
+        try { return { p, mtime: statSync(p).mtimeMs } } catch { return null }
+      })
+      .filter((x): x is { p: string; mtime: number } => x !== null)
+    if (!files.length) return null
+    files.sort((a, b) => b.mtime - a.mtime)
+    return files[0].p
+  } catch { return null }
+}
+
+async function sendRateLimitNotice(text: string) {
+  const body = `⚠️ Claude Code hit its 5-hour usage limit and is paused.\n${text || 'Usage limit reached.'}\nPlease retry after reset.`
+  const chats = new Set<string>(pendingReplies.keys())
+  if (chats.size === 0) {
+    try {
+      const a = loadAccess()
+      for (const cid of Object.keys(a.p2pChats)) chats.add(cid)
+    } catch {}
+  }
+  dbg(`rate_limit detected, notifying ${chats.size} chat(s)`)
+  for (const chatId of chats) {
+    try {
+      await apiClient.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: body }) },
+      })
+    } catch (e) { dbg(`rate_limit notify to ${chatId} failed: ${e}`) }
+    clearReminder(chatId)
+  }
+}
+
+function handleTranscriptEvent(ev: any) {
+  if (!ev || typeof ev !== 'object') return
+  if (ev.error !== 'rate_limit') return
+  if (!ev.isApiErrorMessage) return
+  const uuid: string = ev.uuid ?? ev.message?.id ?? ''
+  if (uuid && notifiedRateLimitUuids.has(uuid)) return
+  if (uuid) notifiedRateLimitUuids.add(uuid)
+  let text = ''
+  const contents = ev.message?.content
+  if (Array.isArray(contents)) {
+    for (const c of contents) if (c?.type === 'text' && c?.text) { text = c.text; break }
+  }
+  void sendRateLimitNotice(text)
+}
+
+async function pollTranscript() {
+  try {
+    const workdir = CLAUDE_WORKDIR ?? process.cwd()
+    const projectDir = projectDirForCwd(workdir)
+    if (!existsSync(projectDir)) return
+    const latest = findLatestTranscript(projectDir)
+    if (!latest) return
+    if (latest !== transcriptPath) {
+      transcriptPath = latest
+      // Start at EOF so we don't replay historical rate-limit events on startup.
+      try { transcriptOffset = statSync(latest).size } catch { transcriptOffset = 0 }
+      transcriptBuf = ''
+      dbg(`transcript tail: ${latest} (start offset ${transcriptOffset})`)
+      return
+    }
+    const size = statSync(latest).size
+    if (size <= transcriptOffset) return
+    let chunk = ''
+    await new Promise<void>((resolve) => {
+      const stream = createReadStream(latest, { start: transcriptOffset, end: size - 1 })
+      stream.on('data', (c) => { chunk += c.toString() })
+      stream.on('end', () => resolve())
+      stream.on('error', () => resolve())
+    })
+    transcriptOffset = size
+    transcriptBuf += chunk
+    let idx: number
+    while ((idx = transcriptBuf.indexOf('\n')) !== -1) {
+      const line = transcriptBuf.slice(0, idx)
+      transcriptBuf = transcriptBuf.slice(idx + 1)
+      if (!line.trim()) continue
+      try { handleTranscriptEvent(JSON.parse(line)) } catch {}
+    }
+  } catch (e) { dbg(`pollTranscript error: ${e}`) }
+}
+
+function startTranscriptMonitor() {
+  if (!CHANNEL_MODE) return
+  dbg('starting transcript rate-limit monitor')
+  setInterval(() => { void pollTranscript() }, TRANSCRIPT_POLL_MS)
+}
+
 // Startup — auto-launch router if needed
 if (CHANNEL_MODE && !WORKER_MODE) {
   if (ensureRouter()) {
@@ -847,6 +956,8 @@ if (WORKER_MODE) {
 } else {
   dbg('passive mode — no WebSocket, no worker inbox')
 }
+
+startTranscriptMonitor()
 
 const mcpPromise = mcp.connect(new StdioServerTransport())
 
